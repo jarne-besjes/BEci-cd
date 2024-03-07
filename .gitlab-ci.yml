@@ -1,0 +1,205 @@
+variables:
+  MOBSIM_PIPELINE_NAME: 'MS: Pipeline'
+  DEV_TOOLS_BASE_IMAGE_TAG: $CI_REGISTRY_IMAGE/dev-tools:dev
+  DEV_TOOLS_IMAGE_TAG: $CI_REGISTRY_IMAGE/dev-tools:$CI_COMMIT_REF_SLUG
+  BACKEND_TEST_BASE_IMAGE_TAG: $CI_REGISTRY_IMAGE/backend-test:dev
+  BACKEND_TEST_IMAGE_TAG: $CI_REGISTRY_IMAGE/backend-test:$CI_COMMIT_REF_SLUG
+  TERM: 'ansi'  # For proper terminal coloring & formatting
+
+# Configure options for the entire pipeline
+workflow:
+  name: $MOBSIM_PIPELINE_NAME
+  auto_cancel:
+    # Auto-cancel behavior: cancel all jobs with `interruptable: true`
+    on_new_commit: interruptible
+  rules:
+    # Do not run the pipeline on MR's with the label 'no ci'
+    - if: '$CI_MERGE_REQUEST_LABELS =~ /(^|,)no ci(,|$)/'
+      when: never
+    # Do not run the pipeline on draft MR's
+    - if: '$CI_MERGE_REQUEST_TITLE =~ /^[Dd]raft:/'
+      when: never
+    # Run the pipeline for MR's and give them a custom name
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      variables:
+        MOBSIM_PIPELINE_NAME: 'MS: Pipeline for MR !$CI_MERGE_REQUEST_IID'
+    # Run the pipeline for protected references
+    - if: $CI_COMMIT_REF_PROTECTED == 'true'
+      # Do not auto-cancel when a newer commit is available
+      auto_cancel:
+        on_new_commit: none
+      variables:
+        MOBSIM_PIPELINE_NAME: 'MS: Pipeline for $CI_COMMIT_REF_NAME (protected)'
+
+# List names and order of pipeline stages
+stages:
+  - prepare               # Build & push docker images for future stages
+  - check                 # Check formatting, linting, typing, etc.
+  - test                  # Run tests
+  - build                 # Build production docker images & frontend
+  - deploy                # Deploy the builds to the production environments
+
+.docker-login: &docker-login
+  - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+prepare:dev-tools:
+  stage: prepare
+  tags: [shell-exec]
+  script:
+    - *docker-login
+    - >
+      docker build
+      --cache-from $DEV_TOOLS_BASE_IMAGE_TAG
+      --cache-from $DEV_TOOLS_IMAGE_TAG
+      -t $DEV_TOOLS_IMAGE_TAG
+      -f ./dev-tools/Dockerfile
+      .
+    - docker push $DEV_TOOLS_IMAGE_TAG
+
+prepare:backend-test:
+  stage: prepare
+  tags: [shell-exec]
+  script:
+    - *docker-login
+    - >
+      docker build
+      --cache-from $BACKEND_TEST_BASE_IMAGE_TAG
+      --cache-from $BACKEND_TEST_IMAGE_TAG
+      -t $BACKEND_TEST_IMAGE_TAG
+      --target testing
+      ./backend
+    - docker push $BACKEND_TEST_IMAGE_TAG
+
+.use-built-image: &use-built-image
+  # Only pull the image if not already present.
+  # It should in practice never pull, since the image has been built in the
+  # prepare stage. If it hadn't been built, this would not be recommended,
+  # since the old image would need to be manually removed to force a pull.
+  pull_policy: always # Until runner config allows if-not-present
+
+.check-job: &check-job
+  stage: check
+  tags: [docker-exec]
+  image:
+    name: $DEV_TOOLS_IMAGE_TAG
+    <<: *use-built-image
+  interruptible: true
+  needs:
+    - 'prepare:dev-tools'
+
+check:docs:
+  <<: *check-job
+  script:
+    - just check-docs
+
+check:backend:formatting:
+  <<: *check-job
+  script:
+    - just fmtcheck-backend
+
+check:backend:linting:
+  <<: *check-job
+  script:
+    - just lint-backend
+
+check:backend:typing:
+  <<: *check-job
+  script:
+    - just typecheck-backend
+
+check:frontend:formatting:
+  <<: *check-job
+  script:
+    - just fmtcheck-frontend
+
+check:frontend:linting:
+  <<: *check-job
+  script:
+    - just lint-frontend
+
+check:frontend:typing:
+  <<: *check-job
+  script:
+    - just typecheck-frontend
+
+test:backend:
+  stage: test
+  tags: [docker-exec]
+  image:
+    name: $BACKEND_TEST_IMAGE_TAG
+    <<: *use-built-image
+  interruptible: true
+  needs:
+    - 'prepare:backend-test'
+  script:
+    - cd backend && pytest
+
+build:frontend:
+  stage: build
+  tags: [docker-exec]
+  image:
+    name: $DEV_TOOLS_IMAGE_TAG
+    <<: *use-built-image
+  needs:
+    - 'prepare:dev-tools'
+  script:
+    - just build-frontend
+  artifacts:
+    paths:
+      - frontend/dist
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+build:backend:
+  stage: build
+  tags: [shell-exec]
+  script:
+    - *docker-login
+    - docker compose -f compose.yaml build
+    - docker compose -f compose.yaml push
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+
+# deploy:frontend:
+pages:
+  stage: deploy
+  tags: [shell-exec]
+  environment: production/pages
+  script:
+    - echo "Deploying frontend to GitLab Pages"
+  artifacts:
+    paths:
+      - frontend/dist
+  publish: frontend/dist
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+      when: manual
+
+deploy:backend:
+  stage: deploy
+  tags: [shell-exec]
+  environment:
+    name: production/server
+    on_stop: stop-backend
+  script:
+    - docker compose -f compose.yaml down --remove-orphans
+    - docker compose -f compose.yaml pull
+    - docker compose -f compose.yaml up -d
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+      when: manual
+
+stop-backend:
+  stage: deploy
+  tags: [shell-exec]
+  environment:
+    name: production/server
+    action: stop
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker compose -f compose.yaml down --remove-orphans
+  rules:
+    - if: $CI_COMMIT_BRANCH == 'main'
+      when: manual
+
